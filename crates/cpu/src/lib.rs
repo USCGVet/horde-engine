@@ -171,6 +171,13 @@ pub fn pin_current_thread(cpu: usize) -> bool {
     sys::pin_current_thread(cpu)
 }
 
+/// Restricts the whole process to `cpus`, e.g. a game client staying off the cores a server on the same PC
+/// uses. Returns false where that isn't supported or `cpus` is empty.
+pub fn restrict_process(cpus: &[usize]) -> bool {
+    let mask = cpus.iter().filter(|&&cpu| cpu < 64).fold(0usize, |m, &cpu| m | 1 << cpu);
+    mask != 0 && sys::restrict_process(mask)
+}
+
 /// Raises the calling thread's priority one step, for the latency-sensitive tick thread.
 pub fn raise_current_thread_priority() -> bool {
     sys::raise_current_thread_priority()
@@ -195,6 +202,7 @@ mod sys {
         fn GetCurrentThread() -> Handle;
         fn GetCurrentProcess() -> Handle;
         fn SetThreadAffinityMask(thread: Handle, mask: usize) -> usize;
+        fn SetProcessAffinityMask(process: Handle, mask: usize) -> i32;
         fn SetThreadPriority(thread: Handle, priority: i32) -> i32;
         fn GetProcessTimes(process: Handle, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
     }
@@ -249,6 +257,11 @@ mod sys {
         unsafe { SetThreadAffinityMask(GetCurrentThread(), 1usize << cpu) != 0 }
     }
 
+    pub fn restrict_process(mask: usize) -> bool {
+        // SAFETY: GetCurrentProcess returns a pseudo-handle that is always valid for this process.
+        unsafe { SetProcessAffinityMask(GetCurrentProcess(), mask) != 0 }
+    }
+
     pub fn raise_current_thread_priority() -> bool {
         // SAFETY: as above.
         unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) != 0 }
@@ -269,6 +282,9 @@ mod sys {
         None
     }
     pub fn pin_current_thread(_cpu: usize) -> bool {
+        false
+    }
+    pub fn restrict_process(_mask: usize) -> bool {
         false
     }
     pub fn raise_current_thread_priority() -> bool {

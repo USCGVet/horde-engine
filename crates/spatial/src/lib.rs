@@ -146,6 +146,29 @@ impl Grid {
         best
     }
 
+    /// Calls `f(slot, dx, dz, d2)` for entities of `group` within `radius` of (x, z), where (dx, dz) points
+    /// from the entity to (x, z), until `f` returns false. Meant for short ranges such as crowd separation:
+    /// keep `radius` near the cell size so only a few cells are visited. Visiting order is fixed, so an
+    /// early stop is deterministic.
+    pub fn for_each_near(&self, x: f32, z: f32, group: u8, radius: f32, mut f: impl FnMut(usize, f32, f32, f32) -> bool) {
+        let base = group as usize * self.cells();
+        let (x0, z0) = self.coords(x - radius, z - radius);
+        let (x1, z1) = self.coords(x + radius, z + radius);
+        let r2 = radius * radius;
+        for gz in z0..=z1 {
+            for gx in x0..=x1 {
+                let b = base + gz as usize * self.cols + gx as usize;
+                for slot in self.start[b] as usize..self.start[b + 1] as usize {
+                    let (dx, dz) = (x - self.x[slot], z - self.z[slot]);
+                    let d2 = dx * dx + dz * dz;
+                    if d2 <= r2 && !f(slot, dx, dz, d2) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// Counts entities of each group within `radius` of (x, z) into `counts`, which must have one entry
     /// per group.
     pub fn count_near(&self, x: f32, z: f32, radius: f32, counts: &mut [u32]) {
@@ -212,6 +235,27 @@ mod tests {
                 });
                 assert_eq!(got, expected, "query {q} group {g}");
             }
+        }
+    }
+
+    #[test]
+    fn for_each_near_finds_exactly_the_group_within_radius() {
+        let (px, pz, group) = scatter(4000, 200.0, 11);
+        let mut grid = Grid::new(200.0, 4.0, 2);
+        grid.rebuild(&px, &pz, |i| Some(group[i]));
+        for q in 0..200 {
+            let (qx, qz) = (rng::unit(5, 0, q, 1) * 200.0, rng::unit(5, 0, q, 2) * 200.0);
+            let mut got: Vec<u32> = Vec::new();
+            grid.for_each_near(qx, qz, 1, 6.0, |slot, _, _, _| {
+                got.push(grid.entity(slot));
+                true
+            });
+            got.sort_unstable();
+            let expected: Vec<u32> = (0..px.len())
+                .filter(|&i| group[i] == 1 && (px[i] - qx).powi(2) + (pz[i] - qz).powi(2) <= 36.0)
+                .map(|i| i as u32)
+                .collect();
+            assert_eq!(got, expected, "query {q}");
         }
     }
 

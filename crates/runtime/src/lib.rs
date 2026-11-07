@@ -2,7 +2,8 @@
 //! starts the job pool, steps the world at its fixed rate, and prints per-second and end-of-run reports.
 //!
 //! A game's server binary parses its own options, hands the rest to [`Options::take_from`], then calls
-//! [`start`] and [`run`].
+//! [`start`] and [`run`]. Work that has to happen around each step, such as networking, plugs in through
+//! [`TickHooks`].
 
 use horde_core::{MAX_PHASES, Phases, Simulation};
 use horde_cpu::{CpuPlan, Placement, Topology};
@@ -11,7 +12,7 @@ use std::time::{Duration, Instant};
 
 /// Help text for the options [`Options::take_from`] understands, for a game to append to its own.
 pub const USAGE: &str = "\
-  --seconds S       how long to run (default 20)
+  --seconds S       how long to run (default 20; 0 runs until stopped)
   --bench           run ticks back to back instead of at the tick rate, to measure headroom
   --cpu MODE        shared (default): leave performance cores to a game client
                     dedicated: one thread on every physical core
@@ -62,6 +63,23 @@ impl Options {
 pub fn parse_number<T: std::str::FromStr>(flag: &str, value: String) -> Result<T, String> {
     value.parse().map_err(|_| format!("{flag}: '{value}' isn't a valid number"))
 }
+
+/// Work the runtime runs around every step of a `S`, such as receiving inputs and sending snapshots.
+pub trait TickHooks<S> {
+    /// Runs before each step, on the tick thread.
+    fn before_step(&mut self, _sim: &mut S) {}
+
+    /// Runs after each step, on the tick thread.
+    fn after_step(&mut self, _sim: &S) {}
+
+    /// Extra text for the per-second report, covering the last `seconds`.
+    fn report(&mut self, _seconds: f64) -> Option<String> {
+        None
+    }
+}
+
+/// No hooks: a headless simulation.
+impl<S> TickHooks<S> for () {}
 
 /// The server's threads: the job pool, plus the calling thread pinned as the tick thread.
 pub struct Host {
@@ -122,9 +140,10 @@ impl Window {
     }
 }
 
-/// Steps `sim` until `options.seconds` have passed, at its tick rate (or back to back with `--bench`),
-/// printing a report every second and a summary at the end.
-pub fn run(options: &Options, host: &Host, sim: &mut impl Simulation) {
+/// Steps `sim` until `options.seconds` have passed (forever if 0), at its tick rate (or back to back with
+/// `--bench`), running `hooks` around each step and printing a report every second and a summary at the
+/// end.
+pub fn run<S: Simulation>(options: &Options, host: &Host, sim: &mut S, hooks: &mut impl TickHooks<S>) {
     let hz = sim.tick_rate().max(1);
     let budget = 1.0 / f64::from(hz);
     let tick_period = Duration::from_secs_f64(budget);
@@ -140,10 +159,21 @@ pub fn run(options: &Options, host: &Host, sim: &mut impl Simulation) {
     let mut window = Window::default();
     let mut window_start = run_start;
     let mut window_cpu = cpu_start;
-    let mut all: Vec<f64> = Vec::with_capacity((options.seconds * f64::from(hz)) as usize + 1);
+    let forever = options.seconds <= 0.0;
+    // Keep tick times for the end-of-run percentiles, allocated up front and capped so an endless or very
+    // fast run stays bounded. A benchmark runs ticks back to back, so it gets a fixed, generous cap.
+    let keep = if options.bench {
+        1 << 20
+    } else if forever {
+        30 * 60 * hz as usize
+    } else {
+        (options.seconds * f64::from(hz)) as usize + 1
+    };
+    let mut all: Vec<f64> = Vec::with_capacity(keep);
+    let mut ticks: u64 = 0;
     let mut next_tick = run_start;
 
-    while run_start.elapsed().as_secs_f64() < options.seconds {
+    while forever || run_start.elapsed().as_secs_f64() < options.seconds {
         if !options.bench {
             let now = Instant::now();
             if next_tick > now {
@@ -151,9 +181,14 @@ pub fn run(options: &Options, host: &Host, sim: &mut impl Simulation) {
             }
             next_tick += tick_period;
         }
+        hooks.before_step(sim);
         let phases = sim.step(&host.pool);
+        hooks.after_step(sim);
         window.add(&phases);
-        all.push(phases.total());
+        ticks += 1;
+        if all.len() < keep {
+            all.push(phases.total());
+        }
 
         let elapsed = window_start.elapsed().as_secs_f64();
         if elapsed >= 1.0 {
@@ -163,8 +198,9 @@ pub fn run(options: &Options, host: &Host, sim: &mut impl Simulation) {
                 _ => "cpu n/a".to_string(),
             };
             let avg = window.avg_ms(window.sums.iter().sum());
+            let extra = hooks.report(elapsed).map(|r| format!("  {r}")).unwrap_or_default();
             println!(
-                "t={:5.1}s  {:4} ticks  avg {:6.3} ms ({:4.1}% of {:.1} ms)  max {:6.3} ms  [{}]  {}  {}",
+                "t={:5.1}s  {:4} ticks  avg {:6.3} ms ({:4.1}% of {:.1} ms)  max {:6.3} ms  [{}]  {}  {}{}",
                 run_start.elapsed().as_secs_f64(),
                 window.ticks,
                 avg,
@@ -174,6 +210,7 @@ pub fn run(options: &Options, host: &Host, sim: &mut impl Simulation) {
                 window.breakdown(),
                 cores,
                 sim.status(),
+                extra,
             );
             window = Window::default();
             window_start = Instant::now();
@@ -189,7 +226,7 @@ pub fn run(options: &Options, host: &Host, sim: &mut impl Simulation) {
     all.sort_by(f64::total_cmp);
     let pct = |p: f64| all[((all.len() - 1) as f64 * p) as usize] * 1e3;
     let mean = all.iter().sum::<f64>() / all.len() as f64;
-    println!("\n{} ticks in {:.1} s", all.len(), wall);
+    println!("\n{ticks} ticks in {wall:.1} s");
     println!(
         "step time: mean {:.3} ms, median {:.3}, p99 {:.3}, max {:.3}  (budget {:.1} ms at {} Hz)",
         mean * 1e3,
@@ -200,7 +237,7 @@ pub fn run(options: &Options, host: &Host, sim: &mut impl Simulation) {
         hz,
     );
     if options.bench {
-        let rate = all.len() as f64 / wall;
+        let rate = ticks as f64 / wall;
         println!("throughput: {rate:.0} ticks/s, {:.1}x real time at {hz} Hz", rate / f64::from(hz));
     }
     if let (Some(a), Some(b)) = (cpu_start, horde_cpu::process_cpu_seconds()) {
