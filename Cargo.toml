@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+# Engine crates live in crates/, games built on the engine in games/.
+members = ["crates/*", "games/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license-file = "LICENSE"
+publish = false
+
+[workspace.dependencies]
+horde-core = { path = "crates/core" }
+horde-cpu = { path = "crates/cpu" }
+horde-jobs = { path = "crates/jobs" }
+horde-runtime = { path = "crates/runtime" }
+horde-spatial = { path = "crates/spatial" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1

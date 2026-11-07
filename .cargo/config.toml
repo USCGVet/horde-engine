@@ -1,0 +1,3 @@
+# Built and run on the same PC: use every instruction this CPU has (see docs/DESIGN.md, D5).
+[build]
+rustflags = ["-C", "target-cpu=native"]

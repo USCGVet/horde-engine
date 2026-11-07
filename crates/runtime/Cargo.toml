@@ -1,0 +1,16 @@
+[package]
+name = "horde-runtime"
+description = "Runs a Simulation as a dedicated server: CPU placement, fixed-rate tick loop, reports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[dependencies]
+horde-core.workspace = true
+horde-cpu.workspace = true
+horde-jobs.workspace = true
+
+[lints]
+workspace = true

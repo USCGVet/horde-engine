@@ -1,0 +1,21 @@
+[package]
+name = "skirmish"
+description = "Test game on Horde Engine: a small defending side against a horde, fighting over capture points"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "skirmish-server"
+path = "src/main.rs"
+
+[dependencies]
+horde-core.workspace = true
+horde-jobs.workspace = true
+horde-runtime.workspace = true
+horde-spatial.workspace = true
+
+[lints]
+workspace = true

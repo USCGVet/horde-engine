@@ -1,0 +1,11 @@
+[package]
+name = "horde-cpu"
+description = "CPU topology, the server's CPU plan, and thread placement"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
