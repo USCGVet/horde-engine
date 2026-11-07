@@ -14,13 +14,16 @@ The foundations, the engine/game boundary and the reasons behind each choice are
 - `crates/horde-core`: randomness, phase timing, the `Simulation` trait
 - `crates/horde-spatial`: spatial grid for neighbour queries
 - `crates/horde-runtime`: runs a `Simulation` as a dedicated server
+- `crates/horde-net`: UDP protocol and prioritised replication; `horde-netprobe` test client
 - `games/skirmish`: test game, a small defending side against a horde
 
-## Status: milestone 1
+## Status: milestone 2a
 
-A headless simulation benchmark. The server leaves the performance cores to a game client on the same
-PC, runs skirmish's deterministic battle on a pinned job pool at a fixed tick rate, and reports per-phase
-tick time and CPU use. Networking and a client come in milestone 2.
+The server leaves the performance cores to a game client on the same PC, runs skirmish's deterministic
+battle on a pinned job pool at a fixed tick rate, and accepts players over UDP. A player takes over one of
+the defenders and receives every soldier's state, nearby ones every tick and distant ones as the
+bandwidth budget allows. The graphical client comes in milestone 2b; until then `horde-netprobe` plays
+headlessly and measures update rates.
 
 ## Build and run
 
@@ -32,6 +35,10 @@ cargo build --release
 cargo run --release -p skirmish --bin skirmish-server
 cargo run --release -p skirmish --bin skirmish-server -- --bots 5000 --bench --seconds 10
 cargo run --release -p skirmish --bin skirmish-server -- --help
+
+# networked: start the server, then in another terminal join with test players
+cargo run --release -p skirmish --bin skirmish-server -- --listen 127.0.0.1:7777 --seconds 0
+cargo run --release -p horde-net --bin horde-netprobe -- --server 127.0.0.1:7777 --clients 4
 ```
 
 Binaries are built with `target-cpu=native` for the PC they're built on (`.cargo/config.toml`), so they

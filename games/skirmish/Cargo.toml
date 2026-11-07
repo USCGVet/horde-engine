@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 horde-core.workspace = true
 horde-jobs.workspace = true
+horde-net.workspace = true
 horde-runtime.workspace = true
 horde-spatial.workspace = true
 

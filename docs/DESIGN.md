@@ -50,8 +50,8 @@ only: no BF2 code, data or assets are used.
 | `horde-jobs` | Fork-join job pool tuned for fixed-rate ticks; `DisjointSlice` for parallel writes | M1 |
 | `horde-core` | Stateless randomness, per-phase step timing, the `Simulation` trait | M1 |
 | `horde-spatial` | Uniform grid bucketed by (group, cell) for neighbour queries | M1 |
-| `horde-runtime` | Runs a `Simulation` as a dedicated server: CPU placement, tick loop, reports | M1 |
-| `horde-net` | Protocol, snapshots, interest management, lag compensation | M2 |
+| `horde-runtime` | Runs a `Simulation` as a dedicated server: CPU placement, tick loop, `TickHooks`, reports | M1 |
+| `horde-net` | UDP protocol, prioritised replication, server and client endpoints, `horde-netprobe` | M2a |
 | `horde-client` | Renderer, input, prediction, interpolation | M2 |
 | `horde-assets` | glTF pipeline, terrain | M3 |
 
@@ -65,8 +65,10 @@ AI building blocks, spawning, data-driven definitions.
 | `skirmish` | Test game: a small defending side holds capture points against a horde. Library plus `skirmish-server`. |
 
 A game implements `horde_core::Simulation` (tick rate, `step`, status line, checksum) and owns its
-components, rules and content. Its server binary parses its own options, then hands the rest to
-`horde_runtime`.
+components, rules and content. To be playable over the network it also implements
+`horde_net::Replicated`: it maps its entities onto the engine's `EntityState` and takes players' inputs.
+Its server binary parses its own options, then hands the rest to `horde_runtime`, passing a `NetServer`
+as the runtime's `TickHooks` when it listens for players.
 
 ### Where a feature belongs
 
@@ -122,15 +124,33 @@ bit-identical. Every game's tests must check this with different thread counts, 
 
 ## Networking (M2)
 
-- UDP, server-authoritative, with versioned packets.
-- Snapshots are delta-compressed against the last state each client acknowledged.
-- **Interest management.** Each client gets a per-entity priority based on distance, visibility, whether
-  the entity is shooting at them, and time since its last update. Nearby soldiers update every tick and
-  distant ones less often. This replaces BF2's fixed budget that starved close-range updates.
+Done in M2a (`horde-net`):
+
+- **UDP, server-authoritative, versioned packets.** Every packet carries a header with magic, version,
+  kind, its own sequence number, and an ack plus a 32-bit field of earlier acks. Datagrams stay under
+  1,200 bytes.
+- **Only changes are sent.** For every client and every entity, the server keeps the quantised state the
+  client has acknowledged (its baseline). An entity whose current state matches its baseline costs
+  nothing. When a snapshot packet is acknowledged, the states in it become the new baselines; lost
+  packets just leave the entity eligible again.
+- **Interest management by priority accumulation.** Each changed entity's priority grows every tick by
+  its relevance to that client: 1 within 60 m, falling with distance squared beyond, never below 0.01. The
+  highest priorities fill the client's per-tick byte budget (default 48 KB) and reset to 0. Nearby
+  soldiers update every tick and distant ones as often as the budget allows, and nothing starves. This
+  replaces BF2's fixed budget that starved close-range updates.
+- **Compact records.** Entity id as a varint delta in ascending order (usually 1 byte), then x and z as
+  16-bit fractions of the world (1.6 cm on a 1 km map), facing in 1/256 turns, a flags byte (alive, team,
+  kind) and health: 8 bytes per entity update.
+- **Inputs** go client to server each frame, with the previous 3 repeated against packet loss. The
+  server applies the newest one each tick.
+- 32-bit entity ids and multi-packet snapshots: no fixed object ceiling.
+
+Still to do in M2b, with the real client:
+
 - **Client prediction** for the local player. Remote soldiers interpolate behind a ~100 ms buffer.
 - **Lag compensation.** The server keeps a short position history and checks each shot against what that
-  client was seeing when it fired.
-- 32-bit entity IDs with a generation counter, and no fixed object ceiling.
+  client was seeing when it fired. Until then, player shots are checked against current positions.
+- Building snapshots for several clients in parallel on the job pool.
 
 ## AI (M4)
 
@@ -153,6 +173,9 @@ bit-identical. Every game's tests must check this with different thread counts, 
 - `cargo run --release -p skirmish --bin skirmish-server -- --bench --seconds 10` runs ticks back to back
   and reports per-phase time and CPU use. Run it before and after any performance change. Build first:
   `cargo test` doesn't rebuild the server binary.
+- Network check: start `skirmish-server --listen 127.0.0.1:7777`, then run
+  `horde-netprobe --server 127.0.0.1:7777 --clients 4`. It joins as players, moves and fires, and reports
+  bandwidth plus how often entities near, mid-range and far from the player get updated.
 
 ## Milestones
 
@@ -160,6 +183,8 @@ bit-identical. Every game's tests must check this with different thread counts, 
    holding 30 Hz on the efficient cores. Engine and first game split apart.
 2. **M2 — Networking and a minimal client.** Join over LAN, see and fight the horde, with smooth
    movement at 1,000 bots.
+   - **M2a — Networking (done).** Protocol, prioritised replication, player control, headless probe.
+   - **M2b — Client.** Window, renderer, input, interpolation and prediction.
 3. **M3 — Terrain.** Heightmap terrain from original or generated data.
 4. **M4 — Navigation-mesh AI with squads and a commander.**
 5. **M5 — Vehicles.**
@@ -178,6 +203,10 @@ bit-identical. Every game's tests must check this with different thread counts, 
 | D7 | Spatial grid bucketed by (group, cell) | A query for one group touches only that group. With one shared bucket per cell, horde soldiers scanned their own crowd: 50,000 bots took 671 ms per tick single-threaded. Per-team buckets cut that to 2.9 ms. |
 | D8 | Engine crates in `crates/`, games in `games/`, joined by the `Simulation` trait | Many games can share one engine, and game rules can't leak into engine systems. Split at M1, before networking and vehicles were written against a mixed crate. |
 | D9 | Original content only; proprietary license | The author owns everything in the repository. See `LICENSE`. |
+| D10 | Own UDP protocol on `std::net`, no networking crate | The hard part is replication policy (baselines, priorities, budgets), which no general crate does our way. The transport underneath is about 150 lines. |
+| D11 | Engine-defined `EntityState` (position, facing, team, kind, alive, health) that games map onto | One compact 8-byte record serves every shooter-style game. A game-defined payload can be added when one needs it. |
+| D12 | Replication by acknowledged baselines plus priority accumulation within a byte budget | Stationary entities cost nothing, nearby ones update every tick, and distant ones degrade gracefully instead of starving. Measured below. |
+| D13 | Networking runs as `TickHooks` around the step, on the tick thread | Keeps the runtime independent of networking and inputs deterministic (applied before the step). Per-client snapshot building can move onto the job pool when player counts call for it. |
 
 ## Measurements
 
@@ -193,6 +222,17 @@ map, 14 defenders against the rest.
 | 200,000 | 3.0 ms | 11× | — |
 
 In real time the server averages well under one core of CPU.
+
+Networking (M2a), same PC over loopback, players measured with `horde-netprobe`. An update interval of 1
+tick means every tick (33 ms):
+
+| Bots | Players | Out per player | Server net time | Update interval near / mid / far (p50 = p99) |
+|---|---|---|---|---|
+| 1,000 | 1 | 237 KB/s | 0.08 ms/tick | 1 / – / 1 tick |
+| 10,000 | 4 | 1.3 MB/s | 1.6 ms/tick (all 4) | 1 / 1 / 2 ticks |
+
+At 10,000 bots the 48 KB budget fits about 5,400 updates per tick, so the 9,986 distant horde soldiers
+each update every other tick while everything within 200 m updates every tick.
 
 **Open issue — wake-up latency.** At 30 Hz the workers sleep between ticks, and waking the efficient
 cores costs up to about 5 ms on some ticks. That's why real-time p99 is about 5 ms while back to back

@@ -7,6 +7,7 @@
 
 use horde_core::{PhaseTimer, Phases, Simulation, rng};
 use horde_jobs::{DisjointSlice, JobPool};
+use horde_net::{EntityState, PlayerInput, Replicated};
 use horde_spatial::Grid;
 
 pub const TEAMS: usize = 2;
@@ -30,6 +31,10 @@ const RESPAWN_DELAY: f32 = 8.0;
 const SPAWN_SPREAD: f32 = 15.0;
 const CAPTURE_RADIUS: f32 = 25.0;
 const CAPTURE_SECONDS: f32 = 10.0;
+/// A human player's rifle: faster and more accurate than a bot's, within a narrow aim cone.
+const PLAYER_FIRE_INTERVAL: f32 = 0.12;
+const PLAYER_HIT_CHANCE: f32 = 0.8;
+const PLAYER_AIM_CONE: f32 = 0.10;
 
 // Salts that keep each random decision independent.
 const SALT_SHOT: u64 = 1;
@@ -84,10 +89,15 @@ pub struct World {
     team: Vec<u8>,
     pos_x: Vec<f32>,
     pos_z: Vec<f32>,
+    /// Facing in radians: 0 faces +z, positive turns toward +x.
+    yaw: Vec<f32>,
     health: Vec<f32>,
     cooldown: Vec<f32>,
     respawn: Vec<f32>,
     target: Vec<u32>,
+    /// Soldiers controlled by a connected player instead of the AI, and their latest controls.
+    human: Vec<bool>,
+    input: Vec<PlayerInput>,
     /// Living soldiers, one group per team.
     grid: Grid,
     points: Vec<CapturePoint>,
@@ -120,10 +130,13 @@ impl World {
             team: (0..n).map(|i| u8::from(i >= cfg.bots[0])).collect(),
             pos_x: vec![0.0; n],
             pos_z: vec![0.0; n],
+            yaw: vec![0.0; n],
             health: vec![MAX_HEALTH; n],
             cooldown: vec![0.0; n],
             respawn: vec![0.0; n],
             target: vec![NO_TARGET; n],
+            human: vec![false; n],
+            input: vec![PlayerInput::default(); n],
             grid: Grid::new(size, GRID_CELL, TEAMS),
             points,
             objectives: [Vec::new(), Vec::new()],
@@ -168,11 +181,15 @@ impl World {
     /// The parallel pass: sensing, targeting, movement and firing for every living soldier.
     fn think(&mut self, pool: &JobPool) {
         let (dt, tick, seed, map) = (self.dt, self.tick, self.cfg.seed, self.cfg.map_size);
-        let World { team, pos_x, pos_z, health, cooldown, target, grid, points, objectives, hits, .. } = self;
-        let (team, health, grid, points, objectives) = (&*team, &*health, &*grid, &*points, &*objectives);
+        let World {
+            team, pos_x, pos_z, yaw, health, cooldown, target, human, input, grid, points, objectives, hits, ..
+        } = self;
+        let (team, health, human, input) = (&*team, &*health, &*human, &*input);
+        let (grid, points, objectives) = (&*grid, &*points, &*objectives);
         let n = team.len();
         let pos_x = DisjointSlice::new(pos_x);
         let pos_z = DisjointSlice::new(pos_z);
+        let yaw = DisjointSlice::new(yaw);
         let cooldown = DisjointSlice::new(cooldown);
         let target = DisjointSlice::new(target);
         let hits = DisjointSlice::new(hits);
@@ -182,8 +199,9 @@ impl World {
             let out = unsafe { hits.get_mut(range.start / CHUNK) };
             for i in range {
                 // SAFETY: as above.
-                let (x, z, cool, tgt) =
-                    unsafe { (pos_x.get_mut(i), pos_z.get_mut(i), cooldown.get_mut(i), target.get_mut(i)) };
+                let (x, z, facing, cool, tgt) = unsafe {
+                    (pos_x.get_mut(i), pos_z.get_mut(i), yaw.get_mut(i), cooldown.get_mut(i), target.get_mut(i))
+                };
                 if health[i] <= 0.0 {
                     *tgt = NO_TARGET;
                     continue;
@@ -191,12 +209,44 @@ impl World {
                 *cool = (*cool - dt).max(0.0);
                 let my_team = team[i];
                 let enemy_team = (my_team + 1) % TEAMS as u8;
+
+                if human[i] {
+                    let controls = &input[i];
+                    let (mut mx, mut mz) = (controls.move_x, controls.move_z);
+                    let len = (mx * mx + mz * mz).sqrt();
+                    if len > 1.0 {
+                        (mx, mz) = (mx / len, mz / len);
+                    }
+                    *facing = controls.yaw;
+                    *tgt = NO_TARGET;
+                    if controls.fire && *cool <= 0.0 {
+                        *cool = PLAYER_FIRE_INTERVAL;
+                        // Hit the nearest enemy in range if it's inside the aim cone.
+                        if let Some((slot, d2)) = grid.nearest_in_group(*x, *z, enemy_team, FIRE_RANGE) {
+                            let to_enemy = (grid.x(slot) - *x).atan2(grid.z(slot) - *z);
+                            let off = (to_enemy - controls.yaw + std::f32::consts::PI)
+                                .rem_euclid(std::f32::consts::TAU)
+                                - std::f32::consts::PI;
+                            let cone = PLAYER_AIM_CONE + 1.0 / d2.sqrt().max(1.0);
+                            if off.abs() < cone && rng::unit(seed, tick, i, SALT_SHOT) < PLAYER_HIT_CHANCE {
+                                let enemy = grid.entity(slot);
+                                *tgt = enemy;
+                                out.push(Hit { attacker: i as u32, target: enemy, damage: SHOT_DAMAGE });
+                            }
+                        }
+                    }
+                    *x = (*x + mx * RUN_SPEED * dt).clamp(0.0, map);
+                    *z = (*z + mz * RUN_SPEED * dt).clamp(0.0, map);
+                    continue;
+                }
+
                 let (vx, vz) = match grid.nearest_in_group(*x, *z, enemy_team, SIGHT) {
                     Some((slot, d2)) if d2 <= FIRE_RANGE * FIRE_RANGE => {
                         let enemy = grid.entity(slot);
                         *tgt = enemy;
                         let d = d2.sqrt().max(0.01);
                         let (dx, dz) = ((grid.x(slot) - *x) / d, (grid.z(slot) - *z) / d);
+                        *facing = dx.atan2(dz);
                         if *cool <= 0.0 {
                             *cool = FIRE_INTERVAL;
                             let chance = 0.05 + 0.4 * (1.0 - d / FIRE_RANGE);
@@ -218,6 +268,9 @@ impl World {
                         head_for_objective(*x, *z, &objectives[my_team as usize], points)
                     }
                 };
+                if *tgt == NO_TARGET && (vx != 0.0 || vz != 0.0) {
+                    *facing = vx.atan2(vz);
+                }
                 *x = (*x + vx * dt).clamp(0.0, map);
                 *z = (*z + vz * dt).clamp(0.0, map);
             }
@@ -347,6 +400,52 @@ impl Simulation for World {
     }
 }
 
+/// A joining player takes over one of your side's bots, the way BF2's coop mode swapped a player in for a
+/// bot; when they leave, the AI takes it back.
+impl Replicated for World {
+    fn world_size(&self) -> f32 {
+        self.cfg.map_size
+    }
+
+    fn entity_count(&self) -> usize {
+        self.team.len()
+    }
+
+    fn entity_state(&self, entity: usize) -> EntityState {
+        EntityState {
+            x: self.pos_x[entity],
+            z: self.pos_z[entity],
+            yaw: self.yaw[entity],
+            team: self.team[entity],
+            kind: 0,
+            alive: self.health[entity] > 0.0,
+            health: (self.health[entity] / MAX_HEALTH).max(0.0),
+        }
+    }
+
+    fn spawn_player(&mut self) -> Option<u32> {
+        let free = |w: &World, i: usize| w.team[i] == 0 && !w.human[i];
+        let pick = (0..self.team.len())
+            .find(|&i| free(self, i) && self.health[i] > 0.0)
+            .or_else(|| (0..self.team.len()).find(|&i| free(self, i)))?;
+        self.human[pick] = true;
+        self.input[pick] = PlayerInput::default();
+        Some(pick as u32)
+    }
+
+    fn despawn_player(&mut self, entity: u32) {
+        if let Some(h) = self.human.get_mut(entity as usize) {
+            *h = false;
+        }
+    }
+
+    fn apply_input(&mut self, entity: u32, input: &PlayerInput) {
+        if let Some(slot) = self.input.get_mut(entity as usize) {
+            *slot = *input;
+        }
+    }
+}
+
 /// Velocity toward the nearest of `objectives`; zero once standing on it.
 fn head_for_objective(x: f32, z: f32, objectives: &[usize], points: &[CapturePoint]) -> (f32, f32) {
     let nearest = objectives.iter().map(|&p| &points[p]).min_by(|a, b| {
@@ -379,6 +478,26 @@ mod tests {
         let single = run(0, 2400, [100, 900]);
         assert_eq!(single, run(3, 2400, [100, 900]));
         assert_eq!(single, run(7, 2400, [100, 900]));
+    }
+
+    #[test]
+    fn a_player_takes_over_a_defender_and_follows_input() {
+        let pool = JobPool::unpinned(2);
+        let mut world = World::new(Config { bots: [3, 50], ..Config::default() });
+        let me = world.spawn_player().expect("a defender is free") as usize;
+        assert_eq!(world.team[me], 0);
+        let start = (world.pos_x[me], world.pos_z[me]);
+        world.apply_input(me as u32, &PlayerInput { move_x: 1.0, move_z: 0.0, yaw: 1.0, fire: false });
+        for _ in 0..30 {
+            world.step(&pool);
+        }
+        let state = world.entity_state(me);
+        assert!((state.x - start.0 - RUN_SPEED).abs() < 0.01, "moved {} m in 1 s", state.x - start.0);
+        assert!((state.z - start.1).abs() < 1e-3);
+        assert_eq!(state.yaw, 1.0);
+
+        world.despawn_player(me as u32);
+        assert!(!world.human[me]);
     }
 
     #[test]

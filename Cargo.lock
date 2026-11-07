@@ -21,6 +21,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "horde-net"
+version = "0.1.0"
+dependencies = [
+ "horde-runtime",
+]
+
+[[package]]
 name = "horde-runtime"
 version = "0.1.0"
 dependencies = [
@@ -42,6 +49,7 @@ version = "0.1.0"
 dependencies = [
  "horde-core",
  "horde-jobs",
+ "horde-net",
  "horde-runtime",
  "horde-spatial",
 ]

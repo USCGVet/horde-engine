@@ -14,6 +14,7 @@ publish = false
 horde-core = { path = "crates/core" }
 horde-cpu = { path = "crates/cpu" }
 horde-jobs = { path = "crates/jobs" }
+horde-net = { path = "crates/net" }
 horde-runtime = { path = "crates/runtime" }
 horde-spatial = { path = "crates/spatial" }
 

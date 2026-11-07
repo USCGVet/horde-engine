@@ -16,6 +16,9 @@ first: it holds the foundations, the engine/game boundary, the milestone plan an
 - `cargo build --release`, then `cargo run --release -p skirmish --bin skirmish-server -- --bench --seconds 10`,
   is the headless benchmark. Run it before and after any performance change and quote both numbers.
   Build first: `cargo test` doesn't rebuild the server binary, so a stale one gives misleading numbers.
+- Network check: run `skirmish-server --listen 127.0.0.1:7777` in the background, then
+  `horde-netprobe --server 127.0.0.1:7777 --clients 4 --seconds 15` (both from `target/release`). Update
+  intervals near the player should stay at 1 tick.
 
 ## Rules
 
