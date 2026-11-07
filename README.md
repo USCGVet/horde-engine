@@ -15,15 +15,22 @@ The foundations, the engine/game boundary and the reasons behind each choice are
 - `crates/horde-spatial`: spatial grid for neighbour queries
 - `crates/horde-runtime`: runs a `Simulation` as a dedicated server
 - `crates/horde-net`: UDP protocol and prioritised replication; `horde-netprobe` test client
-- `games/skirmish`: test game, a small defending side against a horde
+- `crates/horde-client`: window, DirectX 12 renderer, input, camera, smoothing
+- `games/skirmish`: test game, a small defending side against a horde, and its server
+- `games/skirmish-client`: the skirmish client
+- `tools/`: dependency license check, client screenshot
 
-## Status: milestone 2a
+## Status: milestone 2b, playable
 
-The server leaves the performance cores to a game client on the same PC, runs skirmish's deterministic
-battle on a pinned job pool at a fixed tick rate, and accepts players over UDP. A player takes over one of
-the defenders and receives every soldier's state, nearby ones every tick and distant ones as the
-bandwidth budget allows. The graphical client comes in milestone 2b; until then `horde-netprobe` plays
-headlessly and measures update rates.
+The server leaves the performance cores to the client on the same PC, runs skirmish's deterministic
+battle on a pinned job pool at a fixed tick rate, and accepts players over UDP. You take over one of the
+defenders with a rifle; the horde charges and attacks up close, a little slower than you can run. Every soldier's state reaches you, nearby ones every tick and distant ones as the bandwidth
+budget allows, and the client smooths them between updates. Every shot near you shows as a tracer, and
+your hits and kills show as markers around the crosshair. Placeholder graphics for now: soldiers are
+coloured blocks (yours gold, your side blue, the horde red) on a grid.
+
+Controls: click to capture the mouse, mouse aims, WASD moves, left button fires, V switches first/third
+person, mouse wheel zooms, Esc frees the mouse.
 
 ## Build and run
 
@@ -36,10 +43,15 @@ cargo run --release -p skirmish --bin skirmish-server
 cargo run --release -p skirmish --bin skirmish-server -- --bots 5000 --bench --seconds 10
 cargo run --release -p skirmish --bin skirmish-server -- --help
 
-# networked: start the server, then in another terminal join with test players
+# play: start the server, then the client in another terminal
 cargo run --release -p skirmish --bin skirmish-server -- --listen 127.0.0.1:7777 --seconds 0
+cargo run --release -p skirmish-client
+
+# or join with headless test players that measure update rates
 cargo run --release -p horde-net --bin horde-netprobe -- --server 127.0.0.1:7777 --clients 4
 ```
+
+Third-party crates must be under permissive licenses; check with `pwsh tools/check-licenses.ps1`.
 
 Binaries are built with `target-cpu=native` for the PC they're built on (`.cargo/config.toml`), so they
 may not run on an older CPU.

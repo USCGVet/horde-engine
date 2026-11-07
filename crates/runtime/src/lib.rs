@@ -160,9 +160,17 @@ pub fn run<S: Simulation>(options: &Options, host: &Host, sim: &mut S, hooks: &m
     let mut window_start = run_start;
     let mut window_cpu = cpu_start;
     let forever = options.seconds <= 0.0;
-    // Keep every tick time for the end-of-run percentiles, capped so an endless run stays bounded.
-    let keep = if forever { 30 * 60 * hz as usize } else { (options.seconds * f64::from(hz)) as usize + 1 };
+    // Keep tick times for the end-of-run percentiles, allocated up front and capped so an endless or very
+    // fast run stays bounded. A benchmark runs ticks back to back, so it gets a fixed, generous cap.
+    let keep = if options.bench {
+        1 << 20
+    } else if forever {
+        30 * 60 * hz as usize
+    } else {
+        (options.seconds * f64::from(hz)) as usize + 1
+    };
     let mut all: Vec<f64> = Vec::with_capacity(keep);
+    let mut ticks: u64 = 0;
     let mut next_tick = run_start;
 
     while forever || run_start.elapsed().as_secs_f64() < options.seconds {
@@ -177,6 +185,7 @@ pub fn run<S: Simulation>(options: &Options, host: &Host, sim: &mut S, hooks: &m
         let phases = sim.step(&host.pool);
         hooks.after_step(sim);
         window.add(&phases);
+        ticks += 1;
         if all.len() < keep {
             all.push(phases.total());
         }
@@ -217,7 +226,7 @@ pub fn run<S: Simulation>(options: &Options, host: &Host, sim: &mut S, hooks: &m
     all.sort_by(f64::total_cmp);
     let pct = |p: f64| all[((all.len() - 1) as f64 * p) as usize] * 1e3;
     let mean = all.iter().sum::<f64>() / all.len() as f64;
-    println!("\n{} ticks in {:.1} s", all.len(), wall);
+    println!("\n{ticks} ticks in {wall:.1} s");
     println!(
         "step time: mean {:.3} ms, median {:.3}, p99 {:.3}, max {:.3}  (budget {:.1} ms at {} Hz)",
         mean * 1e3,
@@ -228,7 +237,7 @@ pub fn run<S: Simulation>(options: &Options, host: &Host, sim: &mut S, hooks: &m
         hz,
     );
     if options.bench {
-        let rate = all.len() as f64 / wall;
+        let rate = ticks as f64 / wall;
         println!("throughput: {rate:.0} ticks/s, {:.1}x real time at {hz} Hz", rate / f64::from(hz));
     }
     if let (Some(a), Some(b)) = (cpu_start, horde_cpu::process_cpu_seconds()) {

@@ -10,6 +10,8 @@
 //!   reset. So nearby soldiers update every tick, distant ones less often, and nothing starves.
 //! - **No small caps.** Entity IDs are 32-bit varints; a snapshot spans as many packets as the budget
 //!   allows.
+//! - **Shots ride along.** Shots fired near a client, and all of its own, go out once in the snapshot of
+//!   the tick they were fired, for tracers and hit markers.
 //!
 //! See docs/DESIGN.md, "Networking".
 
@@ -19,7 +21,7 @@ mod server;
 mod sockets;
 mod wire;
 
-pub use client::{NetClient, RemoteEntity};
+pub use client::{NetClient, ReceivedShot, RemoteEntity};
 pub use server::{NetServer, ServerConfig};
 pub use wire::Quantized;
 
@@ -37,6 +39,26 @@ pub struct EntityState {
     pub alive: bool,
     /// 0 to 1.
     pub health: f32,
+}
+
+/// A shot fired during the last step, for clients to show (tracers, hit markers). Engine-defined like
+/// [`EntityState`]: every shooter-style game fires shots.
+///
+/// Shots aren't stored or resent. A client gets each relevant one once, in the snapshot of the tick it was
+/// fired, and loses it if that packet is lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shot {
+    pub shooter: u32,
+    /// The entity aimed at, or [`Shot::NO_TARGET`] for a shot at nothing in particular, which flies along
+    /// the shooter's facing.
+    pub target: u32,
+    pub hit: bool,
+    /// The hit killed the target.
+    pub kill: bool,
+}
+
+impl Shot {
+    pub const NO_TARGET: u32 = u32::MAX;
 }
 
 /// One frame of a player's controls, as sent by a client.
@@ -67,4 +89,9 @@ pub trait Replicated {
 
     /// Sets the controls a player's entity follows on the next step.
     fn apply_input(&mut self, entity: u32, input: &PlayerInput);
+
+    /// Shots fired during the last step. Games without shooting can leave this empty.
+    fn shots(&self) -> &[Shot] {
+        &[]
+    }
 }

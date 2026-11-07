@@ -13,11 +13,12 @@
 //!
 //! All integers are little-endian.
 
-use crate::{EntityState, PlayerInput};
+use crate::{EntityState, PlayerInput, Shot};
 use std::f32::consts::TAU;
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"HRD1");
-pub const VERSION: u16 = 1;
+/// 2: snapshots carry shots.
+pub const VERSION: u16 = 2;
 /// Largest datagram either side sends; stays under a typical 1500-byte Ethernet MTU.
 pub const MAX_PACKET: usize = 1200;
 
@@ -33,7 +34,8 @@ pub enum Kind {
     Reject = 3,
     /// client → server: newest input seq u32, count u8, then `count` inputs, newest first.
     Input = 4,
-    /// server → client: server tick u32, newest input applied u32, record count u16, then records.
+    /// server → client: server tick u32, newest input applied u32, record count u16, then records; shot
+    /// count u16, then shots fired that tick.
     Snapshot = 5,
     /// either way: goodbye.
     Disconnect = 6,
@@ -208,6 +210,23 @@ impl Quantized {
     }
 }
 
+/// A shot on the wire: shooter varint, target + 1 varint (0 for no target), flags u8 (bit 0 hit, bit 1
+/// kill). Usually 5 bytes.
+pub fn shot_len(shot: &Shot) -> usize {
+    varint_len(shot.shooter) + varint_len(shot.target.wrapping_add(1)) + 1
+}
+
+pub fn write_shot(buf: &mut Vec<u8>, shot: &Shot) {
+    put_varint(buf, shot.shooter);
+    put_varint(buf, shot.target.wrapping_add(1));
+    buf.push(u8::from(shot.hit) | u8::from(shot.kill) << 1);
+}
+
+pub fn read_shot(r: &mut Reader<'_>) -> Option<Shot> {
+    let (shooter, target, flags) = (r.varint()?, r.varint()?, r.u8()?);
+    Some(Shot { shooter, target: target.wrapping_sub(1), hit: flags & 1 != 0, kill: flags & 2 != 0 })
+}
+
 pub fn write_input(buf: &mut Vec<u8>, input: &PlayerInput) {
     let axis = |v: f32| (v.clamp(-1.0, 1.0) * 127.0).round() as i8 as u8;
     buf.push(axis(input.move_x));
@@ -248,6 +267,26 @@ mod tests {
         assert!((back.yaw - s.yaw).abs() < TAU / 256.0);
         assert_eq!((back.team, back.kind, back.alive), (1, 5, true));
         assert!((back.health - s.health).abs() < 0.01);
+    }
+
+    #[test]
+    fn shots_round_trip() {
+        let shots = [
+            Shot { shooter: 0, target: 1, hit: true, kill: false },
+            Shot { shooter: 70_000, target: Shot::NO_TARGET, hit: false, kill: false },
+            Shot { shooter: 5, target: 0, hit: true, kill: true },
+        ];
+        let mut buf = Vec::new();
+        for shot in &shots {
+            let before = buf.len();
+            write_shot(&mut buf, shot);
+            assert_eq!(buf.len() - before, shot_len(shot));
+        }
+        let mut r = Reader::new(&buf);
+        for shot in &shots {
+            assert_eq!(read_shot(&mut r).as_ref(), Some(shot));
+        }
+        assert!(read_shot(&mut r).is_none());
     }
 
     #[test]

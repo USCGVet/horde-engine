@@ -11,12 +11,21 @@ license-file = "LICENSE"
 publish = false
 
 [workspace.dependencies]
+horde-client = { path = "crates/client" }
 horde-core = { path = "crates/core" }
 horde-cpu = { path = "crates/cpu" }
 horde-jobs = { path = "crates/jobs" }
 horde-net = { path = "crates/net" }
 horde-runtime = { path = "crates/runtime" }
 horde-spatial = { path = "crates/spatial" }
+skirmish = { path = "games/skirmish" }
+# Third-party crates: permissive licenses only (tools/check-licenses.ps1, docs/DESIGN.md D14).
+bytemuck = { version = "1.25", features = ["derive"] }
+glam = "0.34"
+pollster = "1.0"
+# DirectX 12 and WGSL shaders only: skips building Vulkan, Metal, OpenGL and browser support.
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
+winit = "0.30"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -2,44 +2,77 @@
 //!
 //! Soldiers are stored as structure-of-arrays. A step is a serial grid rebuild, one parallel pass over all
 //! soldiers in fixed 64-soldier chunks, and a serial resolve. A task in the parallel pass writes only its
-//! own soldiers and its own chunk's hit buffer; damage to other soldiers is applied afterwards in chunk
+//! own soldiers and its own chunk's shot buffer; damage to other soldiers is applied afterwards in chunk
 //! order, so the result never depends on how many threads ran it (docs/DESIGN.md, "Determinism contract").
 
 use horde_core::{PhaseTimer, Phases, Simulation, rng};
 use horde_jobs::{DisjointSlice, JobPool};
-use horde_net::{EntityState, PlayerInput, Replicated};
+use horde_net::{EntityState, PlayerInput, Replicated, Shot};
 use horde_spatial::Grid;
 
 pub const TEAMS: usize = 2;
 /// `CapturePoint::owner` when neither team holds the point.
 pub const NEUTRAL: u8 = 2;
-const NO_TARGET: u32 = u32::MAX;
+const NO_TARGET: u32 = Shot::NO_TARGET;
 /// Soldiers per parallel chunk: large enough to amortise claiming a chunk, small enough to balance
 /// 17 threads at 1,000 soldiers.
 const CHUNK: usize = 64;
+/// Cells for sighting enemies (searches reach 90 m).
 const GRID_CELL: f32 = 32.0;
+/// Cells for crowd separation (searches reach about a metre), so a dense crowd isn't scanned whole.
+const CROWD_CELL: f32 = 8.0;
 
 // Combat tuning: metres, metres per second, seconds.
 const SIGHT: f32 = 90.0;
-const FIRE_RANGE: f32 = 60.0;
+pub const FIRE_RANGE: f32 = 60.0;
 const RUN_SPEED: f32 = 5.0;
 const COMBAT_SPEED: f32 = 1.5;
 const FIRE_INTERVAL: f32 = 0.6;
 const SHOT_DAMAGE: f32 = 34.0;
 const MAX_HEALTH: f32 = 100.0;
 const RESPAWN_DELAY: f32 = 8.0;
-const SPAWN_SPREAD: f32 = 15.0;
+/// Radius of the area soldiers spawn in around a capture point.
+const SPAWN_SPREAD: f32 = 20.0;
+/// Each base's spawn area, as fractions of the map: this deep from its edge, this wide across the middle.
+const BASE_DEPTH: f32 = 0.10;
+const BASE_WIDTH: f32 = 0.5;
+/// Soldiers closer than this push apart, up to this fast.
+const PERSONAL_SPACE: f32 = 1.2;
+const SEPARATION_SPEED: f32 = 4.0;
+/// Teammates a soldier reacts to at once. Bounds the cost in a packed crowd, where everyone has dozens of
+/// neighbours within reach; a handful is enough to spread out.
+const SEPARATION_NEIGHBOURS: u32 = 6;
 const CAPTURE_RADIUS: f32 = 25.0;
 const CAPTURE_SECONDS: f32 = 10.0;
-/// A human player's rifle: faster and more accurate than a bot's, within a narrow aim cone.
-const PLAYER_FIRE_INTERVAL: f32 = 0.12;
-const PLAYER_HIT_CHANCE: f32 = 0.8;
-const PLAYER_AIM_CONE: f32 = 0.10;
+/// Touch attackers run at the nearest enemy, slower than a running soldier so you can get away, and strike
+/// once they're within reach.
+const TOUCH_RANGE: f32 = 1.5;
+const TOUCH_INTERVAL: f32 = 1.0;
+const TOUCH_DAMAGE: f32 = 20.0;
+const TOUCH_SPEED: f32 = 4.0;
+/// A human player's rifle: faster and more accurate than a bot's. It hits the first enemy along the aim
+/// whose body is within this many metres of the line, plus this much per metre of distance, which
+/// forgives the client drawing enemies a few ticks in the past.
+pub const PLAYER_FIRE_INTERVAL: f32 = 0.12;
+const PLAYER_HIT_CHANCE: f32 = 0.9;
+const PLAYER_AIM_WIDTH: f32 = 0.75;
+const PLAYER_AIM_SPREAD: f32 = 0.05;
 
 // Salts that keep each random decision independent.
 const SALT_SHOT: u64 = 1;
 const SALT_STRAFE: u64 = 2;
 const SALT_SPAWN: u64 = 3;
+const SALT_SPOT: u64 = 4;
+const SALT_SPLIT: u64 = 5;
+
+/// How a team's bots fight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attack {
+    /// Rifles: shoot the nearest enemy in range while strafing.
+    Shoot,
+    /// Run at the nearest enemy in sight and strike on contact.
+    Touch,
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -47,6 +80,8 @@ pub struct Config {
     pub map_size: f32,
     /// Bots per team. Team 0 is your side and starts holding every capture point; team 1 is the horde.
     pub bots: [usize; TEAMS],
+    /// How each team's bots fight. Players always shoot.
+    pub attacks: [Attack; TEAMS],
     pub capture_points: usize,
     pub tick_rate: u32,
     pub seed: u64,
@@ -54,8 +89,24 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { map_size: 1024.0, bots: [14, 986], capture_points: 5, tick_rate: 30, seed: 0x5EED }
+        Config {
+            map_size: 1024.0,
+            bots: [14, 986],
+            attacks: [Attack::Shoot, Attack::Touch],
+            capture_points: 5,
+            tick_rate: 30,
+            seed: 0x5EED,
+        }
     }
+}
+
+/// An attack made in the parallel pass, applied in chunk order during resolve. Ranged ones also go to
+/// clients as shots.
+#[derive(Clone, Copy)]
+struct Strike {
+    shot: Shot,
+    damage: f32,
+    ranged: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -75,13 +126,6 @@ pub struct Stats {
     pub points_held: [u32; TEAMS],
 }
 
-#[derive(Clone, Copy)]
-struct Hit {
-    attacker: u32,
-    target: u32,
-    damage: f32,
-}
-
 pub struct World {
     cfg: Config,
     dt: f32,
@@ -98,13 +142,16 @@ pub struct World {
     /// Soldiers controlled by a connected player instead of the AI, and their latest controls.
     human: Vec<bool>,
     input: Vec<PlayerInput>,
-    /// Living soldiers, one group per team.
+    /// Living soldiers, one group per team: coarse cells for sighting, fine cells for crowd separation.
     grid: Grid,
+    crowd: Grid,
     points: Vec<CapturePoint>,
     /// Per team, the capture points its soldiers head for this tick.
     objectives: [Vec<usize>; TEAMS],
-    /// One buffer per parallel chunk.
-    hits: Vec<Vec<Hit>>,
+    /// Attacks made, one buffer per parallel chunk; damage is applied from them in chunk order.
+    fired: Vec<Vec<Strike>>,
+    /// Every shot of the last step (not touch attacks), for clients.
+    shots: Vec<Shot>,
     stats: Stats,
 }
 
@@ -138,9 +185,12 @@ impl World {
             human: vec![false; n],
             input: vec![PlayerInput::default(); n],
             grid: Grid::new(size, GRID_CELL, TEAMS),
+            // Keep the fine grid to at most 256 cells a side on very large maps.
+            crowd: Grid::new(size, CROWD_CELL.max(size / 256.0), TEAMS),
             points,
             objectives: [Vec::new(), Vec::new()],
-            hits: (0..n.div_ceil(CHUNK)).map(|_| Vec::new()).collect(),
+            fired: (0..n.div_ceil(CHUNK)).map(|_| Vec::new()).collect(),
+            shots: Vec::new(),
             stats: Stats::default(),
             cfg,
         };
@@ -180,23 +230,23 @@ impl World {
 
     /// The parallel pass: sensing, targeting, movement and firing for every living soldier.
     fn think(&mut self, pool: &JobPool) {
-        let (dt, tick, seed, map) = (self.dt, self.tick, self.cfg.seed, self.cfg.map_size);
+        let (dt, tick, seed, map, attacks) = (self.dt, self.tick, self.cfg.seed, self.cfg.map_size, self.cfg.attacks);
         let World {
-            team, pos_x, pos_z, yaw, health, cooldown, target, human, input, grid, points, objectives, hits, ..
+            team, pos_x, pos_z, yaw, health, cooldown, target, human, input, grid, crowd, points, objectives, fired, ..
         } = self;
         let (team, health, human, input) = (&*team, &*health, &*human, &*input);
-        let (grid, points, objectives) = (&*grid, &*points, &*objectives);
+        let (grid, crowd, points, objectives) = (&*grid, &*crowd, &*points, &*objectives);
         let n = team.len();
         let pos_x = DisjointSlice::new(pos_x);
         let pos_z = DisjointSlice::new(pos_z);
         let yaw = DisjointSlice::new(yaw);
         let cooldown = DisjointSlice::new(cooldown);
         let target = DisjointSlice::new(target);
-        let hits = DisjointSlice::new(hits);
+        let fired = DisjointSlice::new(fired);
 
         pool.for_ranges(n, CHUNK, |range| {
-            // SAFETY: this task owns every per-soldier index in `range` and the hit buffer of its chunk.
-            let out = unsafe { hits.get_mut(range.start / CHUNK) };
+            // SAFETY: this task owns every per-soldier index in `range` and the shot buffer of its chunk.
+            let out = unsafe { fired.get_mut(range.start / CHUNK) };
             for i in range {
                 // SAFETY: as above.
                 let (x, z, facing, cool, tgt) = unsafe {
@@ -221,27 +271,22 @@ impl World {
                     *tgt = NO_TARGET;
                     if controls.fire && *cool <= 0.0 {
                         *cool = PLAYER_FIRE_INTERVAL;
-                        // Hit the nearest enemy in range if it's inside the aim cone.
-                        if let Some((slot, d2)) = grid.nearest_in_group(*x, *z, enemy_team, FIRE_RANGE) {
-                            let to_enemy = (grid.x(slot) - *x).atan2(grid.z(slot) - *z);
-                            let off = (to_enemy - controls.yaw + std::f32::consts::PI)
-                                .rem_euclid(std::f32::consts::TAU)
-                                - std::f32::consts::PI;
-                            let cone = PLAYER_AIM_CONE + 1.0 / d2.sqrt().max(1.0);
-                            if off.abs() < cone && rng::unit(seed, tick, i, SALT_SHOT) < PLAYER_HIT_CHANCE {
-                                let enemy = grid.entity(slot);
-                                *tgt = enemy;
-                                out.push(Hit { attacker: i as u32, target: enemy, damage: SHOT_DAMAGE });
-                            }
-                        }
+                        // At whatever is in the crosshair, or at nothing in particular.
+                        let aimed = first_in_line(grid, *x, *z, controls.yaw, enemy_team);
+                        let hit = aimed.is_some() && rng::unit(seed, tick, i, SALT_SHOT) < PLAYER_HIT_CHANCE;
+                        *tgt = aimed.unwrap_or(NO_TARGET);
+                        let shot = Shot { shooter: i as u32, target: *tgt, hit, kill: false };
+                        out.push(Strike { shot, damage: SHOT_DAMAGE, ranged: true });
                     }
                     *x = (*x + mx * RUN_SPEED * dt).clamp(0.0, map);
                     *z = (*z + mz * RUN_SPEED * dt).clamp(0.0, map);
                     continue;
                 }
 
-                let (vx, vz) = match grid.nearest_in_group(*x, *z, enemy_team, SIGHT) {
-                    Some((slot, d2)) if d2 <= FIRE_RANGE * FIRE_RANGE => {
+                let attack = attacks[my_team as usize];
+                let speed = if attack == Attack::Touch { TOUCH_SPEED } else { RUN_SPEED };
+                let (vx, vz) = match (attack, grid.nearest_in_group(*x, *z, enemy_team, SIGHT)) {
+                    (Attack::Shoot, Some((slot, d2))) if d2 <= FIRE_RANGE * FIRE_RANGE => {
                         let enemy = grid.entity(slot);
                         *tgt = enemy;
                         let d = d2.sqrt().max(0.01);
@@ -250,26 +295,53 @@ impl World {
                         if *cool <= 0.0 {
                             *cool = FIRE_INTERVAL;
                             let chance = 0.05 + 0.4 * (1.0 - d / FIRE_RANGE);
-                            if rng::unit(seed, tick, i, SALT_SHOT) < chance {
-                                out.push(Hit { attacker: i as u32, target: enemy, damage: SHOT_DAMAGE });
-                            }
+                            let hit = rng::unit(seed, tick, i, SALT_SHOT) < chance;
+                            let shot = Shot { shooter: i as u32, target: enemy, hit, kill: false };
+                            out.push(Strike { shot, damage: SHOT_DAMAGE, ranged: true });
                         }
                         // Strafe while fighting, switching direction every couple of seconds.
                         let side = if rng::unit(seed, tick / 60, i, SALT_STRAFE) < 0.5 { 1.0 } else { -1.0 };
                         (-dz * side * COMBAT_SPEED, dx * side * COMBAT_SPEED)
                     }
-                    Some((slot, d2)) => {
+                    (Attack::Touch, Some((slot, d2))) => {
+                        // Charge, and strike once within reach.
+                        let enemy = grid.entity(slot);
+                        *tgt = enemy;
+                        let d = d2.sqrt().max(0.01);
+                        let (dx, dz) = ((grid.x(slot) - *x) / d, (grid.z(slot) - *z) / d);
+                        *facing = dx.atan2(dz);
+                        if d > TOUCH_RANGE {
+                            (dx * speed, dz * speed)
+                        } else {
+                            if *cool <= 0.0 {
+                                *cool = TOUCH_INTERVAL;
+                                let shot = Shot { shooter: i as u32, target: enemy, hit: true, kill: false };
+                                out.push(Strike { shot, damage: TOUCH_DAMAGE, ranged: false });
+                            }
+                            (0.0, 0.0)
+                        }
+                    }
+                    (_, Some((slot, d2))) => {
                         *tgt = NO_TARGET;
                         let d = d2.sqrt().max(0.01);
-                        ((grid.x(slot) - *x) / d * RUN_SPEED, (grid.z(slot) - *z) / d * RUN_SPEED)
+                        ((grid.x(slot) - *x) / d * speed, (grid.z(slot) - *z) / d * speed)
                     }
-                    None => {
+                    (_, None) => {
                         *tgt = NO_TARGET;
-                        head_for_objective(*x, *z, &objectives[my_team as usize], points)
+                        head_for_objective(*x, *z, &objectives[my_team as usize], points, i, seed, speed)
                     }
                 };
                 if *tgt == NO_TARGET && (vx != 0.0 || vz != 0.0) {
                     *facing = vx.atan2(vz);
+                }
+                // Keep personal space from teammates, without exceeding a little over running speed.
+                let (sx, sz) = separation(crowd, *x, *z, my_team, i, seed);
+                let (mut vx, mut vz) = (vx + sx * SEPARATION_SPEED, vz + sz * SEPARATION_SPEED);
+                let speed2 = vx * vx + vz * vz;
+                let max_speed = speed * 1.2;
+                if speed2 > max_speed * max_speed {
+                    let k = max_speed / speed2.sqrt();
+                    (vx, vz) = (vx * k, vz * k);
                 }
                 *x = (*x + vx * dt).clamp(0.0, map);
                 *z = (*z + vz * dt).clamp(0.0, map);
@@ -279,15 +351,26 @@ impl World {
 
     /// Serial: damage in chunk order, then deaths and respawns, capture points and stats.
     fn resolve(&mut self) {
-        for buffer in &mut self.hits {
-            for hit in buffer.drain(..) {
-                let victim = hit.target as usize;
-                if self.health[victim] > 0.0 {
-                    self.health[victim] -= hit.damage;
-                    if self.health[victim] <= 0.0 {
-                        self.stats.kills[self.team[hit.attacker as usize] as usize] += 1;
-                        self.respawn[victim] = RESPAWN_DELAY;
+        self.shots.clear();
+        for buffer in &mut self.fired {
+            for strike in buffer.drain(..) {
+                let mut shot = strike.shot;
+                if shot.hit {
+                    let victim = shot.target as usize;
+                    if self.health[victim] > 0.0 {
+                        self.health[victim] -= strike.damage;
+                        if self.health[victim] <= 0.0 {
+                            shot.kill = true;
+                            self.stats.kills[self.team[shot.shooter as usize] as usize] += 1;
+                            self.respawn[victim] = RESPAWN_DELAY;
+                        }
+                    } else {
+                        // Already killed by an earlier attack this tick: this one passes through.
+                        shot.hit = false;
                     }
+                }
+                if strike.ranged {
+                    self.shots.push(shot);
                 }
             }
         }
@@ -345,17 +428,24 @@ impl World {
         let size = self.cfg.map_size;
         let held = self.points.iter().filter(|p| p.owner == team).count();
         let pick = rng::hash(self.cfg.seed ^ rng::hash(self.tick ^ ((i as u64) << 24) ^ SALT_SPAWN));
-        let (cx, cz) = if held == 0 {
-            (if team == 0 { size * 0.08 } else { size * 0.92 }, size * 0.5)
+        let (u, v) = (
+            rng::unit(self.cfg.seed, self.tick, i, SALT_SPAWN),
+            rng::unit(self.cfg.seed, self.tick, i, SALT_SPAWN + 100),
+        );
+        let (x, z) = if held == 0 {
+            // Anywhere in the team's base area along its edge of the map.
+            let depth = u * BASE_DEPTH;
+            let x = if team == 0 { 0.02 + depth } else { 0.98 - depth };
+            (size * x, size * (0.5 - BASE_WIDTH / 2.0 + v * BASE_WIDTH))
         } else {
+            // Spread evenly over a disc around one of the team's capture points.
             let nth = (pick % held as u64) as usize;
             let p = self.points.iter().filter(|p| p.owner == team).nth(nth).expect("counted above");
-            (p.x, p.z)
+            let (angle, radius) = (u * std::f32::consts::TAU, v.sqrt() * SPAWN_SPREAD);
+            (p.x + angle.cos() * radius, p.z + angle.sin() * radius)
         };
-        let angle = rng::unit(self.cfg.seed, self.tick, i, SALT_SPAWN) * std::f32::consts::TAU;
-        let radius = rng::unit(self.cfg.seed, self.tick, i, SALT_SPAWN + 100) * SPAWN_SPREAD;
-        self.pos_x[i] = (cx + angle.cos() * radius).clamp(0.0, size);
-        self.pos_z[i] = (cz + angle.sin() * radius).clamp(0.0, size);
+        self.pos_x[i] = x.clamp(0.0, size);
+        self.pos_z[i] = z.clamp(0.0, size);
         self.health[i] = MAX_HEALTH;
         self.cooldown[i] = 0.0;
         self.target[i] = NO_TARGET;
@@ -369,8 +459,9 @@ impl Simulation for World {
 
     fn step(&mut self, pool: &JobPool) -> Phases {
         let mut timer = PhaseTimer::start();
-        let World { team, pos_x, pos_z, health, grid, .. } = self;
+        let World { team, pos_x, pos_z, health, grid, crowd, .. } = self;
         grid.rebuild(pos_x, pos_z, |i| (health[i] > 0.0).then_some(team[i]));
+        crowd.rebuild(pos_x, pos_z, |i| (health[i] > 0.0).then_some(team[i]));
         self.update_objectives();
         timer.mark("grid");
         self.think(pool);
@@ -444,19 +535,80 @@ impl Replicated for World {
             *slot = *input;
         }
     }
+
+    fn shots(&self) -> &[Shot] {
+        &self.shots
+    }
 }
 
-/// Velocity toward the nearest of `objectives`; zero once standing on it.
-fn head_for_objective(x: f32, z: f32, objectives: &[usize], points: &[CapturePoint]) -> (f32, f32) {
+/// Velocity toward soldier `i`'s own spot on the nearest of `objectives`; zero once there. Each soldier's
+/// spot is fixed for the game, spread over the capture area, so a crowd covers a point instead of piling
+/// onto its centre.
+fn head_for_objective(
+    x: f32,
+    z: f32,
+    objectives: &[usize],
+    points: &[CapturePoint],
+    i: usize,
+    seed: u64,
+    speed: f32,
+) -> (f32, f32) {
     let nearest = objectives.iter().map(|&p| &points[p]).min_by(|a, b| {
         let da = (a.x - x).powi(2) + (a.z - z).powi(2);
         let db = (b.x - x).powi(2) + (b.z - z).powi(2);
         da.total_cmp(&db)
     });
     let Some(p) = nearest else { return (0.0, 0.0) };
-    let (dx, dz) = (p.x - x, p.z - z);
+    let angle = rng::unit(seed, 0, i, SALT_SPOT) * std::f32::consts::TAU;
+    let radius = rng::unit(seed, 0, i, SALT_SPOT + 100).sqrt() * CAPTURE_RADIUS * 0.85;
+    let (dx, dz) = (p.x + angle.sin() * radius - x, p.z + angle.cos() * radius - z);
     let d = (dx * dx + dz * dz).sqrt();
-    if d < CAPTURE_RADIUS * 0.5 { (0.0, 0.0) } else { (dx / d * RUN_SPEED, dz / d * RUN_SPEED) }
+    if d < 1.0 { (0.0, 0.0) } else { (dx / d * speed, dz / d * speed) }
+}
+
+/// What a player at (x, z) aiming along `yaw` would hit: the nearest soldier of `team` ahead of them within
+/// rifle range whose body is close enough to the line of fire. Visiting order is fixed, so ties are
+/// deterministic.
+fn first_in_line(grid: &Grid, x: f32, z: f32, yaw: f32, team: u8) -> Option<u32> {
+    let (ax, az) = yaw.sin_cos();
+    let mut best: Option<(f32, u32)> = None;
+    grid.for_each_near(x, z, team, FIRE_RANGE, |slot, dx, dz, _| {
+        // (dx, dz) points from the enemy back to the shooter.
+        let along = -(dx * ax + dz * az);
+        let off = (dx * az - dz * ax).abs();
+        if along > 0.0 && off <= PLAYER_AIM_WIDTH + along * PLAYER_AIM_SPREAD && best.is_none_or(|(b, _)| along < b) {
+            best = Some((along, grid.entity(slot)));
+        }
+        true
+    });
+    best.map(|(_, e)| e)
+}
+
+/// Push away from teammates within personal space: the closer, the harder. Soldiers on exactly the same
+/// spot split along a direction fixed for that pair, so the result doesn't depend on thread order.
+fn separation(crowd: &Grid, x: f32, z: f32, team: u8, me: usize, seed: u64) -> (f32, f32) {
+    let (mut sx, mut sz, mut seen) = (0.0f32, 0.0f32, 0u32);
+    crowd.for_each_near(x, z, team, PERSONAL_SPACE, |slot, dx, dz, d2| {
+        let other = crowd.entity(slot) as usize;
+        if other == me {
+            return true;
+        }
+        if d2 < 1e-8 {
+            let (lo, hi) = (me.min(other), me.max(other));
+            let angle = rng::unit(seed, lo as u64, hi, SALT_SPLIT) * std::f32::consts::TAU;
+            let away = if me == lo { 1.0 } else { -1.0 };
+            sx += angle.sin() * away;
+            sz += angle.cos() * away;
+        } else {
+            let d = d2.sqrt();
+            let push = 1.0 - d / PERSONAL_SPACE;
+            sx += dx / d * push;
+            sz += dz / d * push;
+        }
+        seen += 1;
+        seen < SEPARATION_NEIGHBOURS
+    });
+    (sx, sz)
 }
 
 #[cfg(test)]
@@ -501,9 +653,69 @@ mod tests {
     }
 
     #[test]
-    fn both_sides_score_kills_in_an_even_fight() {
-        // The attackers need about 45 simulated seconds to reach the first capture point.
-        let (_, stats) = run(3, 3000, [500, 500]);
+    fn rifle_kills_are_reported_as_shots_and_touches_are_not() {
+        let pool = JobPool::unpinned(3);
+        let mut world = World::new(Config { bots: [500, 500], ..Config::default() });
+        let (mut rifle_kills, mut misses) = (0u64, 0u64);
+        for _ in 0..3000 {
+            world.step(&pool);
+            for shot in world.shots() {
+                assert_eq!(world.team[shot.shooter as usize], 0, "the horde attacks by touch: {shot:?}");
+                assert!(shot.hit || !shot.kill, "a miss can't kill: {shot:?}");
+                rifle_kills += u64::from(shot.kill);
+                misses += u64::from(!shot.hit);
+            }
+        }
+        assert_eq!(rifle_kills, world.stats().kills[0]);
+        assert!(misses > 0);
+    }
+
+    #[test]
+    fn the_horde_strikes_only_within_reach() {
+        let pool = JobPool::unpinned(1);
+        let mut world = World::new(Config { bots: [1, 2], ..Config::default() });
+        // A player standing still without firing, one horde soldier at arm's length and another 40 m away.
+        let me = world.spawn_player().expect("a defender is free") as usize;
+        for (i, x) in [(me, 500.0), (1, 501.0), (2, 540.0)] {
+            (world.pos_x[i], world.pos_z[i]) = (x, 500.0);
+        }
+        world.step(&pool);
+        assert_eq!(world.health[me], MAX_HEALTH - TOUCH_DAMAGE, "one strike, from the close one");
+        let far = world.pos_x[2];
+        assert!((540.0 - far - TOUCH_SPEED / 30.0).abs() < 1e-3, "the far one charges: now at {far}");
+        assert!(world.shots().is_empty(), "touch attacks aren't shots");
+        // The next strike waits about a second.
+        for _ in 0..25 {
+            world.step(&pool);
+        }
+        assert_eq!(world.health[me], MAX_HEALTH - TOUCH_DAMAGE);
+        for _ in 0..10 {
+            world.step(&pool);
+        }
+        assert_eq!(world.health[me], MAX_HEALTH - 2.0 * TOUCH_DAMAGE);
+    }
+
+    #[test]
+    fn a_player_hits_what_is_in_the_crosshair_not_the_nearest_enemy() {
+        let pool = JobPool::unpinned(1);
+        let mut world = World::new(Config { bots: [1, 2], ..Config::default() });
+        let me = world.spawn_player().expect("a defender is free");
+        // Facing +z: the nearest enemy is 10 m away, ahead and to the right; a farther one is 30 m straight
+        // ahead.
+        for (i, x, z) in [(me as usize, 500.0, 500.0), (1, 506.0, 508.0), (2, 500.0, 530.0)] {
+            (world.pos_x[i], world.pos_z[i]) = (x, z);
+        }
+        world.apply_input(me, &PlayerInput { move_x: 0.0, move_z: 0.0, yaw: 0.0, fire: true });
+        world.step(&pool);
+        let shot = world.shots().iter().find(|s| s.shooter == me).copied().expect("the player fired");
+        assert_eq!(shot.target, 2);
+    }
+
+    #[test]
+    fn both_sides_score_kills_against_the_horde() {
+        // The horde needs about a minute to reach the first capture point. (In an even fight it never gets
+        // close: rifles cut down soldiers that have to run into touching range.)
+        let (_, stats) = run(3, 3000, Config::default().bots);
         assert!(stats.kills[0] > 0 && stats.kills[1] > 0, "{stats:?}");
     }
 }

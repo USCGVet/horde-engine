@@ -25,6 +25,9 @@ struct Report {
     packets: u64,
     ticks: u32,
     known: usize,
+    /// Shots received, and how many of them were this player's own hits.
+    shots: u64,
+    own_hits: u64,
     /// Per band, a histogram of update intervals in server ticks.
     intervals: [Vec<u64>; 3],
 }
@@ -50,9 +53,21 @@ fn run_client(server: SocketAddr, index: usize, seconds: f64) -> Report {
         Ok(c) => c,
         Err(e) => {
             eprintln!("probe {index}: {e}");
-            return Report { connected: false, entity: None, seconds: 0.0, bytes: 0, packets: 0, ticks: 0, known: 0, intervals: Default::default() };
+            return Report {
+                connected: false,
+                entity: None,
+                seconds: 0.0,
+                bytes: 0,
+                packets: 0,
+                ticks: 0,
+                known: 0,
+                shots: 0,
+                own_hits: 0,
+                intervals: Default::default(),
+            };
         }
     };
+    let (mut shots, mut own_hits) = (0u64, 0u64);
     let mut intervals: [Vec<u64>; 3] = std::array::from_fn(|_| vec![0; MAX_INTERVAL]);
     let frame = Duration::from_secs_f64(1.0 / 30.0);
     let start = Instant::now();
@@ -74,6 +89,10 @@ fn run_client(server: SocketAddr, index: usize, seconds: f64) -> Report {
             let interval = ((tick - previous) as usize).min(MAX_INTERVAL - 1);
             intervals[band][interval] += 1;
         });
+        if measuring {
+            shots += client.shots().len() as u64;
+            own_hits += client.shots().iter().filter(|s| s.shot.hit && Some(s.shot.shooter) == client.entity()).count() as u64;
+        }
         // Give the first two seconds to connecting and the initial full download.
         if measure_from.is_none() && client.is_connected() && start.elapsed() >= Duration::from_secs(2) {
             let (bytes, packets) = client.traffic();
@@ -103,6 +122,8 @@ fn run_client(server: SocketAddr, index: usize, seconds: f64) -> Report {
         packets: packets - packets0,
         ticks: client.server_tick().saturating_sub(tick0),
         known: client.entities().iter().filter(|e| e.tick != 0).count(),
+        shots,
+        own_hits,
         intervals,
     }
 }
@@ -137,12 +158,15 @@ fn main() {
         }
         let secs = r.seconds.max(0.001);
         println!(
-            "\nclient {i} (entity {}): {:.0} KB/s in, {:.0} packets/s, {:.1} server ticks/s, {} entities known",
+            "\nclient {i} (entity {}): {:.0} KB/s in, {:.0} packets/s, {:.1} server ticks/s, {} entities known, \
+             {:.0} shots/s seen, {} own hits",
             r.entity.map_or("none".to_string(), |e| e.to_string()),
             r.bytes as f64 / secs / 1024.0,
             r.packets as f64 / secs,
             f64::from(r.ticks) / secs,
             r.known,
+            r.shots as f64 / secs,
+            r.own_hits,
         );
         for (band, (_, label)) in BANDS.iter().enumerate() {
             let hist = &r.intervals[band];

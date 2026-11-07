@@ -3,7 +3,7 @@
 
 use horde_net::{NetServer, ServerConfig};
 use horde_runtime::{Options, USAGE as RUNTIME_USAGE, parse_number};
-use skirmish::{Config, World};
+use skirmish::{Attack, Config, World};
 use std::net::SocketAddr;
 
 const USAGE: &str = "\
@@ -13,6 +13,7 @@ usage: skirmish-server [options]
   --net-budget KB   snapshot kilobytes per player per tick (default 48)
   --bots N          total bots (default 1000)
   --defenders N     bots on your side, team 0 (default 14); the rest are the horde
+  --horde-attack A  how the horde fights: touch (default, charges and strikes up close) or shoot
   --hz N            tick rate (default 30)
   --map METRES      map side length (default 1024)
   --points N        capture points (default 5)
@@ -39,6 +40,13 @@ fn parse_game_args(args: Vec<String>) -> Result<GameArgs, String> {
             "--net-budget" => net_budget_kb = parse_number(&flag, value()?)?,
             "--bots" => bots = parse_number(&flag, value()?)?,
             "--defenders" => defenders = parse_number(&flag, value()?)?,
+            "--horde-attack" => {
+                config.attacks[1] = match value()?.as_str() {
+                    "touch" => Attack::Touch,
+                    "shoot" => Attack::Shoot,
+                    other => return Err(format!("--horde-attack: '{other}' isn't touch or shoot")),
+                }
+            }
             "--hz" => config.tick_rate = parse_number(&flag, value()?)?,
             "--map" => config.map_size = parse_number(&flag, value()?)?,
             "--points" => config.capture_points = parse_number(&flag, value()?)?,
@@ -77,10 +85,11 @@ fn main() {
     let host = horde_runtime::start(&options);
     let mut world = World::new(config.clone());
     println!(
-        "skirmish: {} bots ({} yours, {} horde) on a {} m map",
+        "skirmish: {} bots ({} yours, {} horde attacking by {}) on a {} m map",
         world.soldiers(),
         config.bots[0],
         config.bots[1],
+        if config.attacks[1] == Attack::Touch { "touch" } else { "shooting" },
         config.map_size,
     );
     match game.listen {

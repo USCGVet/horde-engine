@@ -11,7 +11,8 @@ first: it holds the foundations, the engine/game boundary, the milestone plan an
 
 ## Commands
 
-- `cargo test` covers the CPU plan, the job pool, the spatial grid and skirmish's determinism.
+- `cargo test` covers the CPU plan, the job pool, the spatial grid, skirmish's determinism, the wire format,
+  shot delivery over loopback, and the client's smoothing, camera and shot effects.
 - `cargo clippy --all-targets` must stay warning-free.
 - `cargo build --release`, then `cargo run --release -p skirmish --bin skirmish-server -- --bench --seconds 10`,
   is the headless benchmark. Run it before and after any performance change and quote both numbers.
@@ -28,8 +29,14 @@ first: it holds the foundations, the engine/game boundary, the milestone plan an
 - **Hot loops:** no allocation inside per-tick loops. Reuse buffers (clear, don't reallocate).
 - **Randomness:** only from `horde_core::rng` over (seed, tick, entity, salt), never shared state.
 - **Unsafe:** every `unsafe` block gets a `// SAFETY:` comment.
-- **Dependencies:** none in the M1 core. Adding a crate is a design decision; record it in the
-  decision log.
+- **Dependencies:** the simulation core (`horde-cpu`, `horde-jobs`, `horde-core`, `horde-spatial`,
+  `horde-runtime`, `horde-net`, game simulation crates) stays dependency-free. Any crate added anywhere must
+  be under a permissive license; run `pwsh tools/check-licenses.ps1` after changing dependencies, and
+  record the decision in the decision log.
+- **Coordinates:** left-handed, x right, y up, z forward; yaw 0 faces +z and positive yaw turns right
+  (toward +x). Use glam's `camera::lh` functions, never `rh`.
+- **Client screenshots:** `pwsh tools/screenshot-window.ps1 skirmish-client out.png` captures the client
+  window, including GPU content, at full resolution.
 - **Content:** everything is original, made or generated for this project. Never add third-party game
   assets or data.
 - **License:** proprietary, all rights reserved (`LICENSE`). Don't add open-source license headers or files.

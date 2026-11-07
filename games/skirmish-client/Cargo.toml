@@ -1,0 +1,15 @@
+[package]
+name = "skirmish-client"
+description = "Skirmish game client: joins a skirmish-server and lets you play"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[dependencies]
+horde-client.workspace = true
+skirmish.workspace = true
+
+[lints]
+workspace = true

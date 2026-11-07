@@ -1,0 +1,21 @@
+[package]
+name = "horde-client"
+description = "Game client: window, renderer, input, and smoothing of replicated entities"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+glam.workspace = true
+horde-core.workspace = true
+horde-cpu.workspace = true
+horde-net.workspace = true
+pollster.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+
+[lints]
+workspace = true
